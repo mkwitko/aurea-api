@@ -15,22 +15,95 @@ Backend for Aurea, an "AI growth operating system": a founder states a growth go
 
 ## Architecture
 
+System context: the web app talks to this API; a separate worker process runs the AI agents.
+
 ```mermaid
 flowchart LR
-  Web[aurea-web-app] --> API[Fastify API]
+  Founder([Founder]) --> Web[aurea-web-app]
+  Web -->|REST + SSE| API[aurea-api<br/>Fastify, src/app.ts]
   API --> PG[(PostgreSQL / Prisma)]
-  API --> Q[(Redis / BullMQ)]
-  Q --> W[Worker: AI runs, actions, reaper]
-  W --> LLM[LLM provider]
-  W --> Social[Social publishing provider]
-  W --> LF[Langfuse]
-  API --> S3[(R2 / S3 storage)]
+  API --> Redis[(Redis: BullMQ queues, run events)]
+  Redis --> Worker[Worker process<br/>src/worker.ts]
+  Worker --> PG
+  Worker --> LLM[LLM provider<br/>OpenAI-compatible]
+  Worker --> Social[Social publishing provider]
+  Worker --> LF[Langfuse tracing]
+  Worker --> Search[Web search]
+  API --> GA4[GA4 measurement]
+  API --> S3[(R2 / S3)]
+  Stripe -->|webhooks| API
   API --> Stripe
 ```
 
+Layers inside this repo:
+
+```mermaid
+flowchart TD
+  HTTP["HTTP: routes, SSE, webhooks<br/>src/http"] --> Plugins["Auth, tenant, error plugins<br/>src/plugins"]
+  HTTP --> Domain["Feature repositories and services<br/>goals, strategies, experiments, outcomes, learnings"]
+  HTTP --> Billing["Credits, plans, Stripe<br/>src/billing"]
+  HTTP --> Queue["Run queue<br/>src/ai/queue"]
+  Queue --> Runner["Agent runner: tools, guardrails, budgets<br/>src/ai/runner, src/ai/tools"]
+  Runner --> Router["Model router (tiers)<br/>src/ai/model-router"]
+  Runner --> Providers["Provider adapters<br/>src/ai/providers"]
+  Runner --> Trace["Langfuse tracing<br/>src/integrations/tracing"]
+  Actions["Action worker + reaper<br/>src/actions"] --> Social["Social integration<br/>src/integrations/social"]
+  Domain --> PG[(Prisma)]
+  Billing --> PG
+```
+
+Main flow, one paid AI run (`src/http/api/agent-runs/create-agent-run`, `src/billing/credit.service.ts`, `src/ai/runner/runner.ts`):
+
+```mermaid
+sequenceDiagram
+  participant W as Web app
+  participant A as API
+  participant D as PostgreSQL
+  participant Q as Redis / BullMQ
+  participant R as Worker (runner)
+  participant M as LLM provider
+  W->>A: create agent run (task type)
+  A->>D: authorizeAndCharge: lock credit period, write DEBIT ledger row
+  A->>Q: enqueue run
+  A-->>W: run id (SSE stream of status events)
+  Q->>R: job
+  R->>M: model call, tool calls (read-only business tools), submit answer
+  R->>R: guardrail validates output; escalate to next tier on failure
+  R->>D: persist output, cost, tool calls
+  R-->>W: status event via Redis pub/sub and SSE
+  Note over R,D: on failure the run is refunded: a REFUND ledger row, unique per run
+```
+
+Data model summary (`prisma/schema.prisma`, 30 models; main entities only):
+
+```mermaid
+erDiagram
+  Organization ||--o{ Workspace : owns
+  Organization ||--o{ Membership : has
+  User ||--o{ Membership : joins
+  Workspace ||--o{ Business : describes
+  Workspace ||--o{ Goal : sets
+  Workspace ||--o{ Strategy : plans
+  Goal }o--o{ Strategy : StrategyGoal
+  Strategy ||--o{ Hypothesis : tests
+  Hypothesis ||--o{ Experiment : "run as"
+  Experiment ||--o{ Outcome : yields
+  Experiment ||--o{ Learning : teaches
+  Experiment ||--o{ Action : executes
+  Action ||--o{ Approval : "gated by"
+  Workspace ||--o{ AgentRun : triggers
+  AgentRun ||--o{ AgentToolCall : records
+  Workspace ||--o{ CreditPeriod : "monthly allowance"
+  Workspace ||--o{ CreditLedger : "append-only"
+```
+
 - HTTP layer in `src/http`, domain/services in feature folders, integrations behind small clients in `src/integrations`.
+- The AI worker is a separate process (`src/worker.ts`) so an API restart or deploy never kills runs in flight.
+- Credits are debited in the same transaction that locks the monthly period row, and the ledger has a unique (run, kind) key so retries cannot double-charge or double-refund (`src/billing/credit.service.ts`).
+- Runs have caps on tool iterations and model calls, a per-tier cost record and a tier escalation path (`src/ai/runner/runner.ts`, `src/ai/model-router`).
+- Run status changes reach the browser over SSE, fed by Redis pub/sub; a failed publish never fails a run (`src/ai/events/run-events.ts`, `src/http/sse`).
 - Environment is validated at boot (`src/config/env.ts`); missing secrets fail fast.
-- Architecture docs: `docs/architecture/`.
+- Architecture docs: `docs/architecture/` (billing, AI, observability, security, data).
 
 ## Tech stack
 
@@ -75,7 +148,6 @@ scripts/    dev and asset helpers
 
 ## Related repositories
 
-- [aurea-api](https://github.com/mkwitko/aurea-api): backend (Growth Brain, AI agents, billing).
 - [aurea-web-app](https://github.com/mkwitko/aurea-web-app): React frontend.
 
 ## License
