@@ -1,0 +1,6 @@
+# Caddy fronts the API with automatic HTTPS (Let's Encrypt).
+# Requires: API_DOMAIN's A record → this VPS IP, and ports 80/443 open.
+{$API_DOMAIN} {
+	encode gzip
+	reverse_proxy api:3333
+}

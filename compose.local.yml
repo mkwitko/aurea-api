@@ -1,0 +1,75 @@
+# Full local stack in Docker: API + Postgres + Redis (no Caddy/TLS).
+# Zero-config: dev credentials are inline (LOCAL ONLY — never use in prod).
+# Usage: pnpm docker:up   ->   API on http://localhost:3333
+#
+# ⚠️  Este arquivo é uma stack COMPLETA e INDEPENDENTE: o `postgres` daqui tem
+# volume próprio (`aurea_local_pg`) e disputa a porta 5434 com o do
+# `docker-compose.yml` (volume `aurea_pg`). Subir os dois no mesmo projeto
+# recria o container `postgres` apontando para o outro volume — o banco parece
+# apagado, ainda que o volume antigo continue lá. Use um, ou o outro, com
+# `-p` diferente.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aurea
+      POSTGRES_PASSWORD: aurea
+      POSTGRES_DB: aurea
+    ports:
+      - '5434:5432'
+    volumes:
+      - aurea_local_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U aurea']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction']
+    restart: unless-stopped
+    ports:
+      - '6380:6379'
+    volumes:
+      - aurea_local_redis:/data
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://aurea:aurea@postgres:5432/aurea?schema=public
+      API_HOST: 0.0.0.0
+      API_PORT: '3333'
+      CORS_ORIGIN: http://localhost:5173
+      # LOCAL-ONLY secret (>=16 chars). Do not reuse in production.
+      JWT_ACCESS_SECRET: local-dev-access-secret-change-me
+      JWT_ACCESS_TTL: 15m
+      JWT_REFRESH_TTL: 30d
+      REDIS_URL: redis://redis:6379
+    # As chaves de fornecedor (POST_FOR_ME_API_KEY, IA, Stripe) vêm do .env do
+    # host: o bloco acima é só o que precisa ser diferente dentro da rede do
+    # Docker. `required: false` mantém a stack subindo sem .env — as rotas que
+    # dependem de chave respondem 503, que é o desenho.
+    env_file:
+      - path: .env
+        required: false
+    # `migrate deploy`, nunca `db push`: o schema deste repo é gerido por
+    # arquivos de migração, e o `push` compara o schema da IMAGEM com o banco —
+    # numa imagem velha ele tenta dropar coluna que a migração criou. Foi o que
+    # travou este container: build de 3/ago contra um banco oito migrações à
+    # frente. `deploy` só aplica o que falta, e nunca dropa.
+    command: sh -c "pnpm prisma migrate deploy && node dist/server.js"
+    ports:
+      - '3333:3333'
+
+volumes:
+  aurea_local_pg:
+  aurea_local_redis:

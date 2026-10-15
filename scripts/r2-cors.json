@@ -1,0 +1,18 @@
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["http://localhost:5173", "https://app.youraurea.com"],
+      "AllowedMethods": ["PUT"],
+      "AllowedHeaders": ["content-type", "content-length", "x-amz-content-sha256"],
+      "ExposeHeaders": ["etag"],
+      "MaxAgeSeconds": 3600
+    },
+    {
+      "AllowedOrigins": ["http://localhost:5173", "https://app.youraurea.com"],
+      "AllowedMethods": ["GET", "HEAD"],
+      "AllowedHeaders": ["range"],
+      "ExposeHeaders": ["content-length", "content-type", "etag"],
+      "MaxAgeSeconds": 3600
+    }
+  ]
+}

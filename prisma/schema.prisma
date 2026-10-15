@@ -1,0 +1,877 @@
+// AUREA persistence — MVP subset.
+// Canonical model: docs/architecture/persistance-model.md
+// Domain rules/invariants: docs/domains/growth-brain.md
+// Growth Brain is the single source of business truth. Tenant boundary = Organization.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────── Tenancy & Identity ───────────────────────────
+
+enum EntityStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum Plan {
+  STARTER
+  GROWTH
+  SCALE
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  CANCELED
+}
+
+enum CreditEntryKind {
+  DEBIT
+  REFUND
+  PURCHASE
+  GRANT
+}
+
+model Organization {
+  id        String       @id @default(uuid())
+  name      String
+  slug      String       @unique
+  status    EntityStatus @default(ACTIVE)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+  deletedAt DateTime?
+
+  plan                 Plan               @default(STARTER)
+  subscriptionStatus   SubscriptionStatus @default(TRIAL)
+  stripeCustomerId     String?            @unique
+  stripeSubscriptionId String?
+  currentPeriodEnd     DateTime?
+  lastSyncedAt         DateTime?
+
+  workspaces  Workspace[]
+  memberships Membership[]
+}
+
+model Workspace {
+  id             String       @id @default(uuid())
+  organizationId String
+  name           String
+  slug           String
+  status         EntityStatus @default(ACTIVE)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  deletedAt      DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  memberships  Membership[]
+  businesses   Business[]
+  icps         Icp[]
+  goals        Goal[]
+  strategies   Strategy[]
+  hypotheses   Hypothesis[]
+  experiments  Experiment[]
+  outcomes     Outcome[]
+  learnings    Learning[]
+  agentRuns    AgentRun[]
+
+  creditPeriods CreditPeriod[]
+  creditLedger  CreditLedger[]
+  providerKeys  WorkspaceProviderKey[]
+  integrations  WorkspaceIntegration[]
+  metricBindings MetricBinding[]
+  actions            Action[]
+  actionTargets      ActionTarget[]
+  approvals          Approval[]
+  externalReferences ExternalReference[]
+
+  @@unique([organizationId, slug])
+  @@index([organizationId])
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships   Membership[]
+  refreshTokens RefreshToken[]
+}
+
+model Membership {
+  id             String   @id @default(uuid())
+  userId         String
+  organizationId String
+  workspaceId    String?
+  role           Role     @default(MEMBER)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  workspace    Workspace?   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId, workspaceId])
+  @@index([organizationId])
+  @@index([userId])
+}
+
+// Refresh-token rotation/revocation. Store only a hash of the token.
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ─────────────────────────── Business Context ───────────────────────────
+
+model Business {
+  id               String       @id @default(uuid())
+  workspaceId      String
+  name             String
+  description      String?
+  website          String?
+  industry         String?
+  businessModel    String?
+  revenueModel     String?
+  valueProposition String?
+  positioning      String?
+  status           EntityStatus @default(ACTIVE)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  deletedAt        DateTime?
+
+  workspace Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  context   BusinessContext?
+
+  @@index([workspaceId])
+}
+
+model BusinessContext {
+  id               String   @id @default(uuid())
+  businessId       String   @unique
+  currentVersionId String?  @unique
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  business       Business                 @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  currentVersion BusinessContextVersion?  @relation("CurrentVersion", fields: [currentVersionId], references: [id])
+  versions       BusinessContextVersion[] @relation("AllVersions")
+}
+
+enum ContextSource {
+  USER
+  RESEARCH
+  INTEGRATION
+  AI
+  SYSTEM
+}
+
+enum ConfidenceLevel {
+  LOW
+  MEDIUM
+  HIGH
+  VERIFIED
+}
+
+model BusinessContextVersion {
+  id                String          @id @default(uuid())
+  businessContextId String
+  version           Int
+  data              Json
+  // Proveniência por seção: `{[sectionField]: {source, sourceAgentRunId?, confidence?}}`.
+  // `source`/`confidence`/`sourceAgentRunId` acima são da VERSÃO inteira (quem
+  // disparou esta escrita); `meta` é o que o painel usa para desenhar o selo de
+  // IA por seção e decidir o que uma proposta pode sobrescrever sem perguntar.
+  meta              Json?
+  source            ContextSource   @default(USER)
+  confidence        ConfidenceLevel @default(MEDIUM)
+  createdBy         String?
+  sourceAgentRunId  String?
+  createdAt         DateTime        @default(now())
+  supersededAt      DateTime?
+
+  businessContext BusinessContext  @relation("AllVersions", fields: [businessContextId], references: [id], onDelete: Cascade)
+  currentOf       BusinessContext? @relation("CurrentVersion")
+
+  @@unique([businessContextId, version])
+  @@index([businessContextId])
+}
+
+model Icp {
+  id              String       @id @default(uuid())
+  workspaceId     String
+  name            String
+  description     String?
+  characteristics Json?
+  painPoints      Json?
+  customerGoals   Json?
+  buyingTriggers  Json?
+  objections      Json?
+  status          EntityStatus @default(ACTIVE)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  deletedAt       DateTime?
+
+  workspace  Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  goals      GoalIcp[]
+  strategies StrategyIcp[]
+
+  @@index([workspaceId])
+}
+
+// ─────────────────────────── Growth Loop ───────────────────────────
+
+enum GoalStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+model Goal {
+  id            String     @id @default(uuid())
+  workspaceId   String
+  name          String
+  description   String?
+  metric        String
+  baselineValue Float?
+  targetValue   Float?
+  unit          String?
+  deadline      DateTime?
+  priority      Priority   @default(MEDIUM)
+  status        GoalStatus @default(DRAFT)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  completedAt   DateTime?
+
+  workspace  Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  icps       GoalIcp[]
+  strategies StrategyGoal[]
+
+  @@index([workspaceId])
+}
+
+model GoalIcp {
+  goalId String
+  icpId  String
+
+  goal Goal @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  icp  Icp  @relation(fields: [icpId], references: [id], onDelete: Cascade)
+
+  @@id([goalId, icpId])
+}
+
+enum StrategyStatus {
+  DRAFT
+  PROPOSED
+  APPROVED
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+model Strategy {
+  id              String         @id @default(uuid())
+  workspaceId     String
+  name            String
+  description     String?
+  objective       String?
+  strategicThesis String?
+  growthMechanism String?
+  expectedOutcome String?
+  channels        Json?
+  assumptions     Json?
+  evidence        Json?
+  risks           Json?
+  constraints     Json?
+  priority        Priority       @default(MEDIUM)
+  status          StrategyStatus @default(DRAFT)
+  version         Int            @default(1)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  archivedAt      DateTime?
+
+  sourceAgentRunId  String?
+  // O índice primário da adoção — a opção de menor índice entre as escolhidas.
+  // É o que a unicidade abaixo protege: uma opção não pode sustentar duas
+  // estratégias.
+  sourceOptionIndex Int?
+  // Todas as opções que entraram nesta estratégia. Uma adoção pode fundir duas
+  // ou três opções da mesma proposta num único plano, e sem isto o registro
+  // guardaria só uma delas — a proveniência mentiria sobre o que o fundador
+  // combinou.
+  sourceOptionIndexes Int[] @default([])
+
+  workspace   Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  goals       StrategyGoal[]
+  icps        StrategyIcp[]
+  hypotheses  Hypothesis[]
+  experiments Experiment[]
+
+  @@index([workspaceId])
+  @@unique([sourceAgentRunId, sourceOptionIndex])
+}
+
+model StrategyGoal {
+  strategyId String
+  goalId     String
+
+  strategy Strategy @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+  goal     Goal     @relation(fields: [goalId], references: [id], onDelete: Cascade)
+
+  @@id([strategyId, goalId])
+}
+
+model StrategyIcp {
+  strategyId String
+  icpId      String
+
+  strategy Strategy @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+  icp      Icp      @relation(fields: [icpId], references: [id], onDelete: Cascade)
+
+  @@id([strategyId, icpId])
+}
+
+enum HypothesisStatus {
+  DRAFT
+  PROPOSED
+  TESTED
+  VALIDATED
+  REJECTED
+}
+
+model Hypothesis {
+  id              String           @id @default(uuid())
+  workspaceId     String
+  strategyId      String
+  statement       String
+  rationale       String?
+  expectedOutcome String?
+  targetMetric    String?
+  confidence      ConfidenceLevel  @default(MEDIUM)
+  status          HypothesisStatus @default(DRAFT)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  strategy    Strategy     @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+  experiments Experiment[]
+
+  @@index([workspaceId])
+  @@index([strategyId])
+}
+
+enum ExperimentStatus {
+  DRAFT
+  PLANNED
+  APPROVED
+  RUNNING
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+model Experiment {
+  id              String           @id @default(uuid())
+  workspaceId     String
+  strategyId      String
+  hypothesisId    String
+  name            String
+  description     String?
+  objective       String?
+  channel         String?
+  audience        String?
+  variables       Json?
+  metric          String
+  baselineValue   Float?
+  targetValue     Float?
+  successCriteria String?
+  startDate       DateTime?
+  endDate         DateTime?
+  status          ExperimentStatus @default(DRAFT)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  completedAt     DateTime?
+
+  // Proveniência: de qual run de propose-experiment este rascunho nasceu.
+  // Unique porque materializar o mesmo run duas vezes tem de devolver o mesmo
+  // experimento, não criar um segundo dizendo a mesma coisa.
+  sourceAgentRunId String? @unique
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  strategy   Strategy   @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+  hypothesis Hypothesis @relation(fields: [hypothesisId], references: [id], onDelete: Cascade)
+  outcomes   Outcome[]
+  learnings  Learning[]
+  metricBinding MetricBinding?
+  actions       Action[]
+
+  @@index([workspaceId])
+  @@index([strategyId])
+  @@index([hypothesisId])
+}
+
+model Outcome {
+  id           String   @id @default(uuid())
+  workspaceId  String
+  experimentId String
+  metric       String
+  value        Float
+  unit         String?
+  observedAt   DateTime @default(now())
+  source       String   @default("USER")
+  /** O período que este número mede. Nulo no Outcome digitado à mão. */
+  periodStart  DateTime?
+  periodEnd    DateTime?
+  /** Referência externa do que foi lido: property + consulta. */
+  externalRef  String?
+  /** A consulta exata que produziu o número, como a fonte a recebeu. */
+  sourceDetail Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  experiment Experiment @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+  @@index([experimentId])
+}
+
+enum LearningStatus {
+  CANDIDATE
+  VALIDATED
+  REJECTED
+  ARCHIVED
+}
+
+model Learning {
+  id           String          @id @default(uuid())
+  workspaceId  String
+  experimentId String?
+  title        String
+  statement    String
+  evidence     Json?
+  confidence   ConfidenceLevel @default(MEDIUM)
+  status       LearningStatus  @default(CANDIDATE)
+  createdAt    DateTime        @default(now())
+  validatedAt  DateTime?
+  archivedAt   DateTime?
+
+  sourceAgentRunId String?  @unique
+
+  workspace  Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  experiment Experiment? @relation(fields: [experimentId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId])
+  @@index([experimentId])
+}
+
+// ─────────────────────────── AI Execution (operational) ───────────────────────────
+
+enum AgentRunStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model AgentRun {
+  id                String         @id @default(uuid())
+  workspaceId       String
+  agentType         String
+  taskType          String
+  status            AgentRunStatus @default(PENDING)
+  model             String?
+  provider          String?
+  inputTokens       Int?
+  outputTokens      Int?
+  estimatedCost     Float?
+  error             String?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime       @default(now())
+  input             Json?
+  output            Json?
+  tier              String?
+  modelCalls        Int            @default(0)
+  cachedInputTokens Int?
+  inputHash         String?
+  requestedBy       String?
+  queuedAt          DateTime?
+  // Sinal de vida do run. O runner atualiza a cada chamada de modelo, e o
+  // reaper do worker usa isto para distinguir um run lento de um run cujo
+  // processo morreu. Sem ele, um timeout fixo mataria run vivo.
+  heartbeatAt       DateTime?
+  // Escopo de exclusão mútua entre runs (ver AgentDefinition.concurrencyKey).
+  // Dois runs com a mesma chave não podem estar em voo ao mesmo tempo.
+  concurrencyKey    String?
+
+  workspace Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  toolCalls AgentToolCall[]
+
+  @@index([workspaceId])
+  @@index([status, createdAt])
+  @@index([status, heartbeatAt])
+  @@index([workspaceId, concurrencyKey, status])
+  @@index([workspaceId, taskType, inputHash])
+}
+
+model AgentToolCall {
+  id         String   @id @default(uuid())
+  agentRunId String
+  name       String
+  args       Json
+  result     Json?
+  ok         Boolean
+  error      String?
+  durationMs Int
+  startedAt  DateTime
+  createdAt  DateTime @default(now())
+
+  agentRun AgentRun @relation(fields: [agentRunId], references: [id], onDelete: Cascade)
+
+  @@index([agentRunId])
+}
+
+model CreditPeriod {
+  id          String   @id @default(uuid())
+  workspaceId String
+  // Primeiro dia do mês em UTC. A virada é preguiçosa: a linha nasce na
+  // primeira autorização do mês, então workspace inativo não tem linha.
+  periodStart DateTime
+  // Congelado do plano no momento da virada: trocar de plano no meio do mês
+  // não muda o que já foi prometido.
+  allowance   Int
+  consumed    Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, periodStart])
+}
+
+model CreditLedger {
+  id            String          @id @default(uuid())
+  workspaceId   String
+  kind          CreditEntryKind
+  // Assinado (negativo em DEBIT): é o que o extrato mostra.
+  credits       Int
+  // Sempre positivos: são o que o cálculo de saldo usa, sem reinterpretar sinal.
+  fromAllowance Int             @default(0)
+  fromPurchased Int             @default(0)
+  agentRunId    String?
+  reason        String
+  createdAt     DateTime        @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([agentRunId, kind])
+  @@index([workspaceId, createdAt])
+}
+
+model WorkspaceProviderKey {
+  id          String   @id @default(uuid())
+  workspaceId String
+  provider    String
+  ciphertext  Bytes
+  iv          Bytes
+  authTag     Bytes
+  last4       String
+  createdBy   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, provider])
+}
+
+// O Stripe reentrega em retry e pode entregar o mesmo evento duas vezes. Sem
+// esta chave, um `checkout.session.completed` reprocessado credita de novo.
+model StripeEvent {
+  id          String   @id
+  type        String
+  processedAt DateTime @default(now())
+}
+
+/// Uma fonte externa conectada a um workspace. Hoje só analytics (GA4); a
+/// segunda fonte entra aqui, não num modelo novo.
+model WorkspaceIntegration {
+  id          String @id @default(uuid())
+  workspaceId String
+  /// 'GA4' hoje.
+  provider    String
+  /// 'SERVICE_ACCOUNT' | 'OAUTH' — como o conector obtém o token. O caminho
+  /// OAuth depende de verificação do app pelo Google e ainda não existe; o
+  /// discriminador existe para que ele entre sem migrar dado.
+  authKind    String
+  /// Segredo selado no mesmo AES-256-GCM do BYOK (billing/crypto.ts).
+  ciphertext  Bytes
+  iv          Bytes
+  authTag     Bytes
+  /// Identificador na fonte — a property GA4. Fora do segredo de propósito: não
+  /// é sigilo, e a tela precisa mostrá-lo.
+  ///
+  /// Nula entre autorizar no Google e escolher a property — um intervalo real,
+  /// e representá-lo com string vazia seria um valor-sentinela que todo leitor
+  /// teria de conhecer.
+  externalId   String?
+  /// O que o fundador reconhece: e-mail da service account, ou a conta Google.
+  accountLabel String
+  /// 'UNVERIFIED' | 'OK' | 'FAILED'. Guardado em vez de recalculado: health()
+  /// é uma chamada de rede, e a lista não pode custar uma ida ao Google por
+  /// render.
+  status        String    @default("UNVERIFIED")
+  lastCheckedAt DateTime?
+  lastError     String?
+  createdBy     String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  externalReferences ExternalReference[]
+
+  @@unique([workspaceId, provider])
+  @@index([workspaceId])
+}
+
+/// De onde vem o número deste experimento.
+///
+/// 1:1 com o experimento hoje. `Experiment.metric` é texto livre — é o que o
+/// fundador chama de métrica — e nenhum código pode derivar dali uma consulta na
+/// fonte. Esta linha é a declaração humana que fecha essa lacuna, do mesmo jeito
+/// que baseline e target são declarações humanas.
+///
+/// Promoção futura a catálogo de workspace (analytics.md §8-9): relaxar o
+/// @unique e tornar experimentId nulável.
+model MetricBinding {
+  id           String   @id @default(uuid())
+  workspaceId  String
+  experimentId String   @unique
+  /// 'GA4' hoje.
+  provider     String
+  /// Config específica da fonte. GA4: { metric, dimensionFilter? }. Validada por
+  /// schema Zod por provider antes de gravar.
+  config       Json
+  createdBy    String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  experiment Experiment @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+}
+
+enum ActionType {
+  SOCIAL_POST
+}
+
+/// As redes que publicam texto **e** conectam num clique de OAuth.
+///
+/// Quatro: Instagram, TikTok, YouTube e Pinterest exigem mídia; Bluesky pede
+/// senha de app em vez de OAuth, que é a fricção que este desenho existe para
+/// eliminar; e Discord e Telegram não existem no provider
+/// (spec 2026-08-05-post-for-me-migracao §2.2).
+enum SocialPlatform {
+  LINKEDIN
+  X
+  FACEBOOK
+  THREADS
+  /// As três que exigem mídia. Entraram com o upload: sem imagem ou vídeo, um
+  /// post nelas não existe. Pinterest e Bluesky continuam fora — a credencial de
+  /// Pinterest não está habilitada na conta do provider, e Bluesky pede senha de
+  /// app em vez de OAuth.
+  INSTAGRAM
+  TIKTOK
+  YOUTUBE
+  /// Bluesky publica texto, e conecta por `handle` + senha de app em vez de
+  /// OAuth: o provider cria a conta no servidor, sem redirect nenhum.
+  BLUESKY
+}
+
+/// O ciclo de *entrega* de um alvo. Não confundir com `ActionStatus`, que é o de
+/// *aprovação*: aprovar é ato humano sobre o post inteiro, publicar acontece
+/// rede por rede.
+enum ActionTargetStatus {
+  PENDING
+  PUBLISHING
+  PUBLISHED
+  FAILED
+  DELIVERY_UNKNOWN
+}
+
+enum ActionStatus {
+  PROPOSED
+  PENDING_APPROVAL
+  APPROVED
+  EXECUTING
+  EXECUTED
+  /// Publicou em pelo menos uma rede e não em todas. Existe porque `EXECUTED`
+  /// esconderia a falha e `FAILED` negaria um post público real (spec §4.2).
+  PARTIALLY_EXECUTED
+  FAILED
+  CANCELLED
+  DELIVERY_UNKNOWN
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model Action {
+  id           String       @id @default(uuid())
+  workspaceId  String
+  experimentId String?
+  type         ActionType
+  name         String
+  description  String?
+  payload      Json
+  status       ActionStatus @default(PROPOSED)
+  createdBy    String
+  approvedAt   DateTime?
+  executedAt   DateTime?
+  /// O id do post no provider. Serve para **ler** o desfecho por conta — não para
+  /// retentar: a Post for Me não tem endpoint de retry, e tentar outra vez é um
+  /// post novo, permitido só quando a leitura anterior disse que não criou
+  /// (spec de migração §2.5). Nulo até a primeira execução, e preservado depois.
+  ///
+  /// `attempts`, `lastError` e `failureKind` não moram aqui: o desfecho é por
+  /// rede, e um valor só na Action mentiria em N direções (spec §4.2).
+  providerPostId String?
+  /** Sinal de vida do processor. Separa "lento" de "morto" para o reaper. */
+  heartbeatAt  DateTime?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  workspace  Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  // SetNull, e não Cascade: apagar um experimento não pode apagar o registro de
+  // um post que foi publicado no mundo.
+  experiment Experiment? @relation(fields: [experimentId], references: [id], onDelete: SetNull)
+  approvals  Approval[]
+  targets    ActionTarget[]
+
+  @@index([workspaceId])
+  @@index([experimentId])
+  @@index([workspaceId, status])
+}
+
+model Approval {
+  id          String         @id @default(uuid())
+  workspaceId String
+  actionId    String
+  requestedBy String
+  reviewedBy  String?
+  status      ApprovalStatus @default(PENDING)
+  comment     String?
+  requestedAt DateTime       @default(now())
+  reviewedAt  DateTime?
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  action    Action    @relation(fields: [actionId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+  @@index([actionId])
+}
+
+/// Uma rede que um post vai atingir, com o desfecho dela.
+///
+/// `onDelete: Cascade` no `actionId`, diferente do `SetNull` que a Action usa
+/// para `experimentId`: o alvo não tem existência sem o post. O registro do que
+/// foi publicado no mundo é o `ExternalReference`, que não cai por cascade de
+/// Action nenhuma.
+model ActionTarget {
+  id          String             @id @default(uuid())
+  workspaceId String
+  actionId    String
+  platform    SocialPlatform
+  /// A conta do provider que este alvo atinge. É ela que a publicação recebe —
+  /// slug de rede não basta, porque duas contas podem viver na mesma rede.
+  ///
+  /// Snapshot deliberado: a conta pode ser desconectada depois, e o alvo precisa
+  /// continuar dizendo por onde o post saiu.
+  socialAccountId String?
+  status      ActionTargetStatus @default(PENDING)
+  /// O id do post na rede, como o provider devolveu. Nunca inventado.
+  externalId  String?
+  /// A URL pública do post, quando o provider a devolve. É o que o fundador
+  /// clica para conferir — e o que torna "publicado" verificável por ele.
+  postUrl     String?
+  /// A mensagem da fonte, literal. "Missing subreddit" diz o que corrigir;
+  /// "falha ao publicar" não diz nada.
+  lastError   String?
+  failureKind String?
+  attempts    Int                @default(0)
+  publishedAt DateTime?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  action    Action    @relation(fields: [actionId], references: [id], onDelete: Cascade)
+
+  /// Uma rede aparece uma vez por Action: a trava no banco contra publicar duas
+  /// vezes no mesmo lugar pelo mesmo post.
+  @@unique([actionId, platform])
+  @@index([workspaceId])
+  @@index([actionId])
+}
+
+model ExternalReference {
+  id            String   @id @default(uuid())
+  workspaceId   String
+  integrationId String
+  entityType    String
+  entityId      String
+  externalId    String
+  metadata      Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  workspace   Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  integration WorkspaceIntegration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  // Do doc: um externalId do provider mapeia uma coisa só.
+  @@unique([integrationId, entityType, externalId])
+  // Deste design: uma Action não pode ter dois posts na mesma integração. É a
+  // trava de duplicação no banco, para quando a checagem do processor perder a
+  // corrida (spec §6).
+  @@unique([integrationId, entityType, entityId])
+  @@index([workspaceId])
+  @@index([entityType, entityId])
+}
